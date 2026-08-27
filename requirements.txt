@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+numpy
+pandas
+torch
+pennylane
+joblib
+scikit-learn
+qiskit
+nest-asyncio
