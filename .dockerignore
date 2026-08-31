@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-venv/
-.git/
-.gitignore
-*.ipynb
-Qmodels_api.docx

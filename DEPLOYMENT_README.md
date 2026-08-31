@@ -1,14 +1,46 @@
-# Qmodels API - Cloud Run deployment
+# Qmodels API — Cloud Run Deployment
 
-This package is prepared for a Docker + Cloud Build + Cloud Run deployment.
+## Automatic deployment
 
-Important:
-- The application listens on `0.0.0.0` and honors Cloud Run's `PORT` environment variable.
-- Cloud Build uses Artifact Registry in `us-central1`.
-- Cloud Run service name: `qmodels-api`.
-- The build is configured for 2 vCPU, 4 GiB memory, 900s request timeout, and concurrency 1.
-- The existing model/data files are included.
+This repository is configured for:
 
-Deployment choices:
-1. Easiest UI route: connect the GitHub repo to Cloud Build and select `Dockerfile` as the build type.
-2. YAML route: configure the trigger to use `cloudbuild.yaml`.
+GitHub `main` -> Cloud Build trigger `qmodels-api-deploy` -> Docker -> Artifact Registry `qmodels` -> Cloud Run `qmodels-api`.
+
+The Cloud Run service is configured by `cloudbuild.yaml` for:
+- 4 vCPU
+- 16 GiB RAM
+- CPU boost
+- 15 minute request timeout
+- concurrency 1
+- unauthenticated access
+
+## Container paths
+
+Runtime model/data files are under `/app/API_files`.
+The application uses `QAPI_FILES_DIR` if supplied; otherwise it defaults to `/app/API_files`.
+
+## FastAPI
+
+The application listens on `0.0.0.0` and uses the Cloud Run `PORT` environment variable, defaulting to 8080.
+
+Swagger UI:
+`/docs`
+
+OpenAPI:
+`/openapi.json`
+
+## Deployment
+
+After changing code:
+
+```cmd
+git add .
+git commit -m "Update Qmodels API"
+git push
+```
+
+The Cloud Build trigger should deploy the new revision automatically.
+
+## Important
+
+Do not commit secrets, API keys, passwords, or private credentials.

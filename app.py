@@ -22,6 +22,8 @@ import os
 
 from pathlib import Path
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Statevector
@@ -33,7 +35,6 @@ from sklearn.metrics import (
     classification_report,
 )
 
-import nest_asyncio
 import uvicorn
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -124,15 +125,20 @@ def extract_y_true(y_df: pd.DataFrame) -> np.ndarray:
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Flat artifact folder — everything lives here inside the container image
+# (see Dockerfile). Override at runtime with `-e QAPI_FILES_DIR=/some/other/path`
+# if you switch to mounting external storage instead of baking files into the image.
+QAPI_FILES_DIR = os.environ.get("QAPI_FILES_DIR", "/app/API_files")
+
 VQC_N_QUBITS = 20
 VQC_N_LAYERS = 1
 VQC_N_LAYERS_RU = 2
 VQC_THRESHOLD = 0.5
 
-VQC_ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts_50"
+VQC_ARTIFACT_DIR = Path(f"{QAPI_FILES_DIR}/artifacts_50")
 
-VQC_X_TEST_PATH = str(Path(__file__).resolve().parent / "X_Test_rfe_new.csv")
-VQC_Y_TEST_PATH = str(Path(__file__).resolve().parent / "y_Test_rfe_new.csv")
+VQC_X_TEST_PATH = Path(QAPI_FILES_DIR) / "X_Test_rfe_new.csv"
+VQC_Y_TEST_PATH = Path(QAPI_FILES_DIR) / "y_Test_rfe_new.csv"
 
 VQC_BACKEND = "lightning.gpu" if torch.cuda.is_available() else "lightning.qubit"
 vqc_dev = qml.device(VQC_BACKEND, wires=VQC_N_QUBITS)
@@ -188,10 +194,107 @@ def vqc_circuit_reupload(weights, x):
     return qml.expval(qml.PauliZ(0))
 
 
+# ── NUMPY-interface twins of the 5 circuits above, used only by the parallel
+# worker processes below (workers use plain numpy, not torch, to avoid
+# cross-process torch/autograd overhead and pickling issues). Mathematically
+# identical circuits — same gates, same ansatz, same weights.
+@qml.qnode(vqc_dev, interface="numpy")
+def vqc_circuit_rx_np(weights, x):
+    for i in range(VQC_N_QUBITS):
+        qml.RX(x[i], wires=i)
+    vqc_ansatz(weights[0])
+    return qml.expval(qml.PauliZ(0))
+
+
+@qml.qnode(vqc_dev, interface="numpy")
+def vqc_circuit_ry_np(weights, x):
+    for i in range(VQC_N_QUBITS):
+        qml.RY(x[i], wires=i)
+    vqc_ansatz(weights[0])
+    return qml.expval(qml.PauliZ(0))
+
+
+@qml.qnode(vqc_dev, interface="numpy")
+def vqc_circuit_rz_np(weights, x):
+    for i in range(VQC_N_QUBITS):
+        qml.RZ(x[i], wires=i)
+    vqc_ansatz(weights[0])
+    return qml.expval(qml.PauliZ(0))
+
+
+@qml.qnode(vqc_dev, interface="numpy")
+def vqc_circuit_learnable_np(weights, enc, x):
+    for i in range(VQC_N_QUBITS):
+        qml.RY(enc[i, 0] * x[i] + enc[i, 1], wires=i)
+    vqc_ansatz(weights[0])
+    return qml.expval(qml.PauliZ(0))
+
+
+@qml.qnode(vqc_dev, interface="numpy")
+def vqc_circuit_reupload_np(weights, x):
+    for r in range(VQC_N_LAYERS_RU):
+        for i in range(VQC_N_QUBITS):
+            qml.RY(x[i], wires=i)
+        vqc_ansatz(weights[r])
+    return qml.expval(qml.PauliZ(0))
+
+
+# ── Parallel evaluation across CPU cores ────────────────────────────────────
+#
+# WHY THIS EXISTS: unlike QSVC/QKNN (pure amplitude encoding, no entanglement,
+# so fidelity reduces to a closed-form dot product we could vectorize away
+# entirely), VQC's ansatz has real entangling CNOT gates between trained
+# rotations. There's no equivalent classical shortcut — each sample genuinely
+# requires simulating a 20-qubit circuit. The lever here isn't "skip the
+# quantum part", it's "run many of them at once across CPU cores" — PennyLane's
+# lightning backend releases the GIL during C++ simulation, and each circuit
+# evaluation is independent, so this parallelizes cleanly across processes.
+#
+# Uses "fork" so worker processes inherit the already-constructed device and
+# qnodes from this process's memory instead of re-importing/re-pickling them.
+
+_VQC_POOL = None
+_VQC_MAX_WORKERS = os.cpu_count()
+
+
+def _get_vqc_pool():
+    global _VQC_POOL
+    if _VQC_POOL is None:
+        ctx = mp.get_context("fork")
+        _VQC_POOL = ProcessPoolExecutor(max_workers=_VQC_MAX_WORKERS, mp_context=ctx)
+        logger.info(f"[VQC] Started process pool with {_VQC_MAX_WORKERS} workers")
+    return _VQC_POOL
+
+
+def _eval_angle_chunk(circuit_key: str, weights_np: np.ndarray, x_chunk: np.ndarray) -> np.ndarray:
+    circuit_fn = {"rx": vqc_circuit_rx_np, "ry": vqc_circuit_ry_np, "rz": vqc_circuit_rz_np}[circuit_key]
+    return np.array([circuit_fn(weights_np, x) for x in x_chunk])
+
+
+def _eval_learnable_chunk(weights_np: np.ndarray, enc_np: np.ndarray, x_chunk: np.ndarray) -> np.ndarray:
+    return np.array([vqc_circuit_learnable_np(weights_np, enc_np, x) for x in x_chunk])
+
+
+def _eval_reupload_chunk(weights_np: np.ndarray, x_chunk: np.ndarray) -> np.ndarray:
+    return np.array([vqc_circuit_reupload_np(weights_np, x) for x in x_chunk])
+
+
+def _parallel_eval(worker_fn, fixed_args: tuple, X_batch: np.ndarray) -> np.ndarray:
+    """Split X_batch across _VQC_MAX_WORKERS processes and run worker_fn on each chunk."""
+    pool = _get_vqc_pool()
+    n_workers = max(1, min(_VQC_MAX_WORKERS, len(X_batch)))
+    chunks = np.array_split(X_batch, n_workers)
+    chunks = [c for c in chunks if len(c) > 0]
+    futures = [pool.submit(worker_fn, *fixed_args, chunk) for chunk in chunks]
+    results = [f.result() for f in futures]
+    return np.concatenate(results)
+
+
 class AngleVQC(nn.Module):
-    def __init__(self, circuit, n_layers=VQC_N_LAYERS):
+    def __init__(self, circuit, n_layers=VQC_N_LAYERS, circuit_key: str = None):
         super().__init__()
         self.circuit = circuit
+        self.circuit_key = circuit_key  # "rx" / "ry" / "rz" — used for parallel path
         self.weights = nn.Parameter(
             torch.tensor(
                 np.random.uniform(-np.pi, np.pi, (n_layers, VQC_N_QUBITS, 2)),
@@ -200,7 +303,10 @@ class AngleVQC(nn.Module):
         )
 
     def forward(self, X_batch):
-        out = torch.stack([self.circuit(self.weights, x) for x in X_batch])
+        weights_np = self.weights.detach().cpu().numpy()
+        X_np = X_batch.detach().cpu().numpy()
+        out_np = _parallel_eval(_eval_angle_chunk, (self.circuit_key, weights_np), X_np)
+        out = torch.tensor(out_np, dtype=torch.float32, device=X_batch.device)
         return (out.float() + 1.0) / 2.0
 
 
@@ -218,9 +324,11 @@ class LearnableVQC(nn.Module):
         self.enc = nn.Parameter(enc)
 
     def forward(self, X_batch):
-        out = torch.stack(
-            [vqc_circuit_learnable(self.weights, self.enc, x) for x in X_batch]
-        )
+        weights_np = self.weights.detach().cpu().numpy()
+        enc_np = self.enc.detach().cpu().numpy()
+        X_np = X_batch.detach().cpu().numpy()
+        out_np = _parallel_eval(_eval_learnable_chunk, (weights_np, enc_np), X_np)
+        out = torch.tensor(out_np, dtype=torch.float32, device=X_batch.device)
         return (out.float() + 1.0) / 2.0
 
 
@@ -235,7 +343,10 @@ class ReuploadVQC(nn.Module):
         )
 
     def forward(self, X_batch):
-        out = torch.stack([vqc_circuit_reupload(self.weights, x) for x in X_batch])
+        weights_np = self.weights.detach().cpu().numpy()
+        X_np = X_batch.detach().cpu().numpy()
+        out_np = _parallel_eval(_eval_reupload_chunk, (weights_np,), X_np)
+        out = torch.tensor(out_np, dtype=torch.float32, device=X_batch.device)
         return (out.float() + 1.0) / 2.0
 
 
@@ -247,9 +358,9 @@ def vqc_load_model(model_obj, path: Path):
     return model_obj.to(DEVICE)
 
 
-vqc_model_rx = vqc_load_model(AngleVQC(vqc_circuit_rx), VQC_ARTIFACT_DIR / "rx_encoding_weights.pt")
-vqc_model_ry = vqc_load_model(AngleVQC(vqc_circuit_ry), VQC_ARTIFACT_DIR / "ry_encoding_weights.pt")
-vqc_model_rz = vqc_load_model(AngleVQC(vqc_circuit_rz), VQC_ARTIFACT_DIR / "rz_encoding_weights.pt")
+vqc_model_rx = vqc_load_model(AngleVQC(vqc_circuit_rx, circuit_key="rx"), VQC_ARTIFACT_DIR / "rx_encoding_weights.pt")
+vqc_model_ry = vqc_load_model(AngleVQC(vqc_circuit_ry, circuit_key="ry"), VQC_ARTIFACT_DIR / "ry_encoding_weights.pt")
+vqc_model_rz = vqc_load_model(AngleVQC(vqc_circuit_rz, circuit_key="rz"), VQC_ARTIFACT_DIR / "rz_encoding_weights.pt")
 vqc_model_learnable = vqc_load_model(LearnableVQC(), VQC_ARTIFACT_DIR / "learnable_encoding_weights.pt")
 vqc_model_reupload = vqc_load_model(ReuploadVQC(), VQC_ARTIFACT_DIR / "data_re-uploading_weights.pt")
 
@@ -338,19 +449,16 @@ def vqc_classification_metrics(req: MetricsRequest):
 QSVC_N_QUBITS = 6
 QSVC_AMP_DIM = 2 ** QSVC_N_QUBITS  # 64
 
-# Flat artifact folder on the server — everything (VQC weights aside) lives here
-QAPI_FILES_DIR = str(Path(__file__).resolve().parent)
-
 QSVC_N_FEATURES = 44   # UPDATED: retrained QSVC now uses the same feature set as QKNN
 
-QSVC_X_TEST_PATH = f"{QAPI_FILES_DIR}/X_Test_QSVC_38.csv"
-QSVC_Y_TEST_PATH = f"{QAPI_FILES_DIR}/y_Test_QSVC_38.csv"
+QSVC_X_TEST_PATH = Path(QAPI_FILES_DIR) / "X_Test_QSVC_38.csv"
+QSVC_Y_TEST_PATH = Path(QAPI_FILES_DIR) / "y_Test_QSVC_38.csv"
 
 # Needed to rebuild the precomputed kernel against the exact training set the
 # model was fit on. Export this once from the training notebook (see the
 # export snippet) and place it on the server.
-QSVC_XTRAIN_NORM_PATH = f"{QAPI_FILES_DIR}/X_train_norm_38.npy"
-QSVC_MODEL_PATH = f"{QAPI_FILES_DIR}/qsvc_38.pkl"
+QSVC_XTRAIN_NORM_PATH = Path(QAPI_FILES_DIR) / "X_train_norm_38.npy"
+QSVC_MODEL_PATH = Path(QAPI_FILES_DIR) / "qsvc_38.pkl"
 
 # UPDATED real feature names/order (from the retrained QSVC export) — now the
 # same 44 features/order as QKNN. Requests must supply exactly these 44 names.
@@ -468,10 +576,10 @@ QKNN_AMP_DIM = 2 ** QKNN_N_QUBITS  # 64
 
 # CONFIRMED: QKNN uses its own dataset/split (mastergrid_clean_15k.csv), NOT
 # the same file as QSVC (which uses a different, downsampled dataset).
-QKNN_X_TEST_PATH = f"{QAPI_FILES_DIR}/X_Test_QKNN.csv"
-QKNN_Y_TEST_PATH = f"{QAPI_FILES_DIR}/y_Test_QKNN.csv"
+QKNN_X_TEST_PATH = Path(QAPI_FILES_DIR) / "X_Test_QKNN.csv"
+QKNN_Y_TEST_PATH = Path(QAPI_FILES_DIR) / "y_Test_QKNN.csv"
 
-QKNN_MODEL_PATH = f"{QAPI_FILES_DIR}/qknn_model.pkl"   # CONFIRMED, already saved in training nb
+QKNN_MODEL_PATH = Path(QAPI_FILES_DIR) / "qknn_model.pkl"   # CONFIRMED, already saved in training nb
 
 # CONFIRMED real feature names/order (from balanced_data.drop(columns=["x","y","label"])
 # on mastergrid_clean_15k.csv). Requests must supply exactly these 44 names.
@@ -643,20 +751,13 @@ def root():
         },
     }
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUN
+# RUN
 # ══════════════════════════════════════════════════════════════════════════════
+# Cloud Run injects the port to listen on via the PORT env var (defaults to
+# 8080 if unset, e.g. when running locally with `docker run`).
 
 if __name__ == "__main__":
-    nest_asyncio.apply()
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
-        loop="asyncio",
-        log_level="info",
-        access_log=True,
-    )
-    server = uvicorn.Server(config)
-    import asyncio
-    asyncio.run(server.serve())
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
